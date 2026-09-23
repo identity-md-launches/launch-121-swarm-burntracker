@@ -8,12 +8,8 @@
   },
   "contracts": [
     {
-      "contract": "Swarm",
-      "constructorArgs": []
-    },
-    {
-      "contract": "BurnTracker",
-      "constructorArgs": ["$contract:Swarm"]
+      "contract": "SwarmConverter",
+      "constructorArgs": ["$token"]
     }
   ],
   "pool": {
@@ -22,5 +18,5 @@
     "tickSpacing": 60,
     "initialPrice": "79228162514264337593543950336"
   },
-  "notes": "SwarmLaunchToken (SWLT, 18 decimals) is the separate fixed-supply launch token and mints 1,000,000,000 tokens to its constructor caller. Swarm (SWORM, 18 decimals) is the deflationary application token and mints 1,000,000 tokens to its constructor caller. Each Swarm transfer burns floor(amount / 100) minor units and credits the remainder; self-transfers lose only the burn, and zero-amount transfers burn nothing. BurnTracker is immutably bound to Swarm and exposes cumulative burns as the original supply minus current totalSupply. All three contracts are configured at construction, with no initialization calls or owner privileges. Under factory deployment both token supplies are initially held by the factory; this manifest configures no distribution route for application SWORM. The pool pairs SWLT with native ETH, uses no hook, and initialPrice is decimal sqrtPriceX96. The factory supplies the LP and MerkleDistributor."
+  "notes": "SwarmLaunchToken (SWLT, 18 decimals) is the separate fixed-supply launch token and mints 1,000,000,000 tokens to its constructor caller, the factory. SwarmConverter takes the launch token address and creates Swarm (SWORM, 18 decimals) and BurnTracker in its constructor. Swarm mints 1,000,000 tokens to its deployer, the converter. Read the child addresses from SwarmConverter.swarm() and SwarmConverter.burnTracker(). Holders approve SWLT and call convert(launchAmount), a positive multiple of 1,000 minor units, to lock SWLT and receive gross SWORM at 1,000 SWLT per SWORM, less the transfer burn. Holders approve SWORM and call redeem(swarmAmount) to receive 1,000 SWLT per SWORM actually received by the converter after the incoming burn. Each Swarm transfer burns floor(amount / 100) minor units and credits the remainder; self-transfers lose only the burn, and zero-amount transfers burn nothing. BurnTracker is immutably bound to the converter's Swarm and exposes cumulative burns as the original supply minus current totalSupply. All contracts are configured at construction, with no initialization calls or owner privileges. The converter constructor preserves the factory's entire SWLT balance and supply. The pool pairs SWLT with native ETH, uses no hook, and initialPrice is decimal sqrtPriceX96. The factory supplies the LP and MerkleDistributor."
 }
