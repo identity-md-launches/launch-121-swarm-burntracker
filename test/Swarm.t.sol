@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Swarm, SwarmLaunchToken} from "../src/Swarm.sol";
+import {Swarm, SwarmLaunchToken, SwarmConverter} from "../src/Swarm.sol";
 import {BurnTracker} from "../src/BurnTracker.sol";
 
 // Only the Foundry cheatcodes used here are declared, so the suite needs no library.
@@ -28,25 +28,32 @@ interface SwarmVm {
 /// The tracker includes burns before its deployment; reads need no updates.
 ///
 /// Run `forge build`, `forge test`, and `forge test --gas-report`. No dependencies
-/// or configuration changes are needed. The suite has 65 tests, including six
+/// or configuration changes are needed. The suite has 80 tests, including seven
 /// fuzz tests (256 runs each by default), exact events, rounding boundaries,
 /// allowance isolation, revert rollback, invalid tracker inputs and late binding.
 /// Calls after expectRevert intentionally do not inspect a returned bool.
 /// No test imports the removable protected harness. SwarmLaunchToken() supplies
 /// the separate fixed-supply launch token: 1,000,000,000 SWLT with 18 decimals,
-/// minted to its constructor caller. Deploy Swarm and then BurnTracker bound to
-/// Swarm as applications. Their deployment and burns must leave SWLT unchanged.
+/// minted to its constructor caller. Deploy SwarmConverter(address(launchToken))
+/// as the application; read its swarm() and burnTracker() child addresses. The
+/// converter receives the initial SWORM supply, leaving factory SWLT untouched.
+/// Holders approve the converter for SWLT and call convert(launchAmount), a
+/// positive multiple of 1,000 minor units. It returns gross SWORM; the holder
+/// receives that amount minus floor(amount / 100). To redeem, approve SWORM
+/// and call redeem(grossSwarmAmount); it returns/pays 1,000 times the SWORM
+/// actually received after the second burn. Both burns are irreversible.
+/// Donations receive no conversion credit and there is no rescue/admin path.
+/// The tests use the actual fixed-supply launch token, as required at deployment.
 /// The added launch tests cover exact receipt, fixed supply, allowance failures,
 /// zero/self transfers, mint/admin rejection and constructor isolation.
-/// Behavioral tests pass with solc 0.8.26 and 0.8.30. The protected opcode scan
-/// passes for the launch token and tracker built with 0.8.26; with default 0.8.30
-/// metadata it rejects bytes in their CBOR trailers. .imd-findings.json reports
-/// this compiler-dependent artifact issue, which behavioral tests cannot fix.
+/// Converter coverage adds holder access, both burn legs, donation accounting,
+/// supply exhaustion, invalid construction, allowance/balance rollback and
+/// fuzzed round trips. Existing Swarm and launch-token unit tests are retained.
 ///
 /// Gas report: Forge 1.7.1, solc 0.8.30, optimizer disabled. Reproduce the focused
 /// sample with `forge test --gas-report --match-test
 /// 'testTransfer(BurnsExactly|FromSpendsGross)'` (one shell command).
-/// Swarm deployment: 829,094 gas, 3,655 creation bytes.
+/// Swarm deployment: 829,082 gas, 3,655 creation bytes.
 /// Transfer 100 SWORM to fresh ALICE: 59,759 gas.
 /// Approve SPENDER for 200 SWORM from zero allowance: 46,540 gas.
 /// TransferFrom 100 SWORM against that finite allowance: 65,954 gas.
@@ -59,6 +66,13 @@ interface SwarmVm {
 /// Transfer 100 SWLT to fresh ALICE: 52,191 gas.
 /// Approve SPENDER for 200 SWLT from zero allowance: 46,540 gas.
 /// TransferFrom 200 SWLT to fresh BOB, exhausting allowance: 53,574 gas.
+/// Converter sample: `forge test --gas-report --match-test
+/// testRedeemPaysForNetSwarmAndEmitsRedemption` (one shell command).
+/// SwarmConverter deployment including its children: 1,712,048 gas,
+/// 8,958 creation bytes including constructor arguments.
+/// Convert 100,000 SWLT with exact allowance, emptying the holder: 96,322 gas.
+/// Redeem the resulting 99 SWORM with exact allowance: 82,330 gas.
+/// Measurements use solc 0.8.30; both legs include their token calls.
 abstract contract SwarmTestBase {
     SwarmVm internal constant vm = SwarmVm(address(uint160(uint256(keccak256("hevm cheat code")))));
     uint256 internal constant SUPPLY = 1_000_000 ether;
@@ -765,5 +779,383 @@ contract SwarmLaunchTokenTest is SwarmTestBase {
             self ? directAmount : directAmount - delegatedAmount,
             self ? 0 : delegatedAmount
         );
+    }
+}
+
+/// @dev Exercises the real launch-token/converter/Swarm dependency graph.
+contract SwarmConverterTest is SwarmTestBase {
+    uint256 internal constant RATE = 1_000;
+    uint256 internal constant LAUNCH_SUPPLY = 1_000_000_000 ether;
+    SwarmLaunchToken internal launchToken;
+    SwarmConverter internal converter;
+
+    function setUp() public override {
+        launchToken = new SwarmLaunchToken();
+        converter = new SwarmConverter(address(launchToken));
+        token = converter.swarm();
+        tracker = converter.burnTracker();
+    }
+
+    function _convertForAlice(uint256 launchAmount) internal {
+        require(launchToken.transfer(ALICE, launchAmount), "funding failed");
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), launchAmount), "conversion approval failed");
+        vm.prank(ALICE);
+        _eq(converter.convert(launchAmount), launchAmount / RATE, "wrong gross conversion return");
+    }
+
+    function _assertConverterAccounting() internal view {
+        uint256 reserve = token.balanceOf(address(converter));
+        _eq(
+            reserve + token.balanceOf(address(this)) + token.balanceOf(ALICE) + token.balanceOf(BOB)
+                + token.balanceOf(SPENDER),
+            token.totalSupply(),
+            "converter SWORM balances do not sum to supply"
+        );
+        _eq(token.totalSupply() + tracker.totalBurned(), SUPPLY, "converter burns do not match supply loss");
+        _eq(launchToken.totalSupply(), LAUNCH_SUPPLY, "conversion changed launch supply");
+        uint256 locked = launchToken.balanceOf(address(converter));
+        _eq(
+            locked + launchToken.balanceOf(address(this)) + launchToken.balanceOf(ALICE) + launchToken.balanceOf(BOB)
+                + launchToken.balanceOf(SPENDER),
+            LAUNCH_SUPPLY,
+            "converter launch balances do not sum to supply"
+        );
+        require(locked >= RATE * (SUPPLY - reserve), "converter backing is insufficient");
+        _eq(token.balanceOf(address(0)), 0, "burn credited zero address");
+    }
+
+    function _state() internal view returns (bytes32 result) {
+        result = keccak256(abi.encode(token.totalSupply(), launchToken.totalSupply(), tracker.totalBurned()));
+        address[5] memory accounts = [address(this), ALICE, BOB, SPENDER, address(converter)];
+        for (uint256 i; i < accounts.length; ++i) {
+            result = keccak256(
+                abi.encode(
+                    result,
+                    token.balanceOf(accounts[i]),
+                    launchToken.balanceOf(accounts[i]),
+                    token.allowance(accounts[i], address(converter)),
+                    launchToken.allowance(accounts[i], address(converter))
+                )
+            );
+        }
+    }
+
+    function _assertConversionEvent(SwarmVm.Log memory entry, string memory signature, uint256 first, uint256 second)
+        internal
+        view
+    {
+        require(entry.emitter == address(converter), "wrong converter event emitter");
+        _eq(entry.topics.length, 2, "wrong converter event topic count");
+        require(entry.topics[0] == keccak256(bytes(signature)), "wrong converter event signature");
+        require(entry.topics[1] == bytes32(uint256(uint160(ALICE))), "wrong converter event account");
+        (uint256 actualFirst, uint256 actualSecond) = abi.decode(entry.data, (uint256, uint256));
+        _eq(actualFirst, first, "wrong converter event first amount");
+        _eq(actualSecond, second, "wrong converter event second amount");
+    }
+
+    function testConverterRejectsInvalidLaunchDependencies() public {
+        address[3] memory invalid = [address(0), ALICE, address(token)];
+        bytes32 beforeState = _state();
+        for (uint256 i; i < invalid.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(SwarmConverter.InvalidLaunchToken.selector, invalid[i]));
+            new SwarmConverter(invalid[i]);
+        }
+        vm.expectRevert();
+        new SwarmConverter(address(tracker)); // Code exists, but no totalSupply interface.
+        require(_state() == beforeState, "failed constructor changed existing deployment");
+        _assertConverterAccounting();
+    }
+
+    function testConvertLocksGrossLaunchAmountAndEmitsBurnAndConversion() public {
+        require(launchToken.transfer(ALICE, 100_000 ether), "funding failed");
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), 100_000 ether), "approval failed");
+        vm.recordLogs();
+        vm.prank(ALICE);
+        _eq(converter.convert(100_000 ether), 100 ether, "wrong gross conversion return");
+        _eq(launchToken.balanceOf(ALICE), 0, "conversion did not lock all input");
+        _eq(launchToken.balanceOf(address(converter)), 100_000 ether, "wrong launch collateral");
+        _eq(launchToken.allowance(ALICE, address(converter)), 0, "conversion allowance not spent");
+        _eq(token.balanceOf(ALICE), 99 ether, "conversion did not deliver net SWORM");
+        _eq(token.balanceOf(address(converter)), SUPPLY - 100 ether, "wrong reserve debit");
+        _eq(tracker.totalBurned(), 1 ether, "conversion burn missing");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 4, "wrong conversion event count");
+        _assertTransferLog(entries[0], address(launchToken), ALICE, address(converter), 100_000 ether);
+        _assertTransferLog(entries[1], address(token), address(converter), ALICE, 99 ether);
+        _assertTransferLog(entries[2], address(token), address(converter), address(0), 1 ether);
+        _assertConversionEvent(entries[3], "Converted(address,uint256,uint256)", 100_000 ether, 100 ether);
+        _assertConverterAccounting();
+    }
+
+    function testRedeemPaysForNetSwarmAndEmitsRedemption() public {
+        _convertForAlice(100_000 ether);
+        vm.prank(ALICE);
+        require(token.approve(address(converter), 99 ether), "redemption approval failed");
+        vm.recordLogs();
+        vm.prank(ALICE);
+        _eq(converter.redeem(99 ether), 98_010 ether, "redemption must price net incoming SWORM");
+        _eq(token.balanceOf(ALICE), 0, "redemption did not debit gross SWORM");
+        _eq(token.allowance(ALICE, address(converter)), 0, "redemption allowance not spent");
+        _eq(token.balanceOf(address(converter)), SUPPLY - 1.99 ether, "wrong reserve after redemption");
+        _eq(launchToken.balanceOf(ALICE), 98_010 ether, "wrong redemption payment");
+        _eq(launchToken.balanceOf(address(converter)), 1_990 ether, "wrong remaining collateral");
+        _eq(tracker.totalBurned(), 1.99 ether, "both burn legs must be counted");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 4, "wrong redemption event count");
+        _assertTransferLog(entries[0], address(token), ALICE, address(converter), 98.01 ether);
+        _assertTransferLog(entries[1], address(token), ALICE, address(0), 0.99 ether);
+        _assertTransferLog(entries[2], address(launchToken), address(converter), ALICE, 98_010 ether);
+        _assertConversionEvent(entries[3], "Redeemed(address,uint256,uint256)", 98.01 ether, 98_010 ether);
+        _assertConverterAccounting();
+    }
+
+    function testConverterRoundsEachBurnAtMinorUnitBoundaries() public {
+        uint256[6] memory gross = [uint256(1), 99, 100, 101, 199, 200];
+        uint256[6] memory outboundBurn = [uint256(0), 0, 1, 1, 1, 2];
+        uint256[6] memory inboundBurn = [uint256(0), 0, 0, 1, 1, 1];
+        uint256 burned;
+        for (uint256 i; i < gross.length; ++i) {
+            _convertForAlice(gross[i] * RATE);
+            uint256 received = gross[i] - outboundBurn[i];
+            _eq(token.balanceOf(ALICE), received, "wrong rounded conversion receipt");
+            vm.prank(ALICE);
+            require(token.approve(address(converter), received), "rounding approval failed");
+            uint256 previousLaunch = launchToken.balanceOf(ALICE);
+            vm.prank(ALICE);
+            _eq(converter.redeem(received), (received - inboundBurn[i]) * RATE, "wrong rounded redemption");
+            _eq(
+                launchToken.balanceOf(ALICE) - previousLaunch,
+                (received - inboundBurn[i]) * RATE,
+                "wrong rounded payout"
+            );
+            burned += outboundBurn[i] + inboundBurn[i];
+            _eq(tracker.totalBurned(), burned, "wrong rounded cumulative burns");
+            _eq(launchToken.balanceOf(address(converter)), burned * RATE, "wrong round-trip collateral remainder");
+            _assertConverterAccounting();
+        }
+    }
+
+    function testConverterInvalidAmountsPreserveBalancesAllowancesAndBurns() public {
+        _convertForAlice(100_000 ether);
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), type(uint256).max), "launch approval failed");
+        vm.prank(ALICE);
+        require(token.approve(address(converter), type(uint256).max), "Swarm approval failed");
+        bytes32 beforeState = _state();
+        uint256[5] memory invalid = [uint256(0), 1, RATE - 1, RATE + 1, type(uint256).max];
+        for (uint256 i; i < invalid.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(SwarmConverter.InvalidAmount.selector, invalid[i]));
+            vm.prank(ALICE);
+            converter.convert(invalid[i]);
+            require(_state() == beforeState, "invalid conversion changed state");
+        }
+        vm.expectRevert(abi.encodeWithSelector(SwarmConverter.InvalidAmount.selector, 0));
+        vm.prank(ALICE);
+        converter.redeem(0);
+        require(_state() == beforeState, "zero redemption changed state");
+    }
+
+    function testConvertRequiresCallersFullAllowanceAndRejectsReuse() public {
+        uint256 amount = 100_000 ether;
+        require(launchToken.transfer(ALICE, amount), "funding failed");
+        uint256[2] memory insufficient = [uint256(0), amount - 1];
+        for (uint256 i; i < insufficient.length; ++i) {
+            vm.prank(ALICE);
+            require(launchToken.approve(address(converter), insufficient[i]), "approval failed");
+            bytes32 beforeState = _state();
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    SwarmLaunchToken.ERC20InsufficientAllowance.selector, address(converter), insufficient[i], amount
+                )
+            );
+            vm.prank(ALICE);
+            converter.convert(amount);
+            require(_state() == beforeState, "insufficient allowance changed conversion state");
+        }
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), amount), "approval failed");
+        bytes32 approvedState = _state();
+        vm.expectRevert(
+            abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, address(converter), 0, amount)
+        );
+        vm.prank(BOB);
+        converter.convert(amount);
+        require(_state() == approvedState, "another caller spent Alice's conversion allowance");
+        vm.prank(ALICE);
+        _eq(converter.convert(amount), 100 ether, "conversion failed");
+        bytes32 convertedState = _state();
+        vm.expectRevert(
+            abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, address(converter), 0, amount)
+        );
+        vm.prank(ALICE);
+        converter.convert(amount);
+        require(_state() == convertedState, "conversion allowance reused");
+        _assertConverterAccounting();
+    }
+
+    function testConvertInsufficientBalanceRestoresSpentAllowance() public {
+        require(launchToken.transfer(ALICE, RATE - 1), "funding failed");
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), RATE), "approval failed");
+        bytes32 beforeState = _state();
+        vm.expectRevert(
+            abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientBalance.selector, ALICE, RATE - 1, RATE)
+        );
+        vm.prank(ALICE);
+        converter.convert(RATE);
+        require(_state() == beforeState, "failed launch pull changed state");
+        _assertConverterAccounting();
+    }
+
+    function testRedeemRequiresGrossAllowanceAndRejectsReuse() public {
+        _convertForAlice(100_000 ether);
+        uint256[2] memory insufficient = [uint256(0), 98.01 ether];
+        for (uint256 i; i < insufficient.length; ++i) {
+            vm.prank(ALICE);
+            require(token.approve(address(converter), insufficient[i]), "approval failed");
+            bytes32 beforeState = _state();
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    Swarm.ERC20InsufficientAllowance.selector, address(converter), insufficient[i], 99 ether
+                )
+            );
+            vm.prank(ALICE);
+            converter.redeem(99 ether);
+            require(_state() == beforeState, "insufficient redemption allowance changed state");
+        }
+        vm.prank(ALICE);
+        require(token.approve(address(converter), 99 ether), "approval failed");
+        vm.prank(ALICE);
+        _eq(converter.redeem(99 ether), 98_010 ether, "redemption failed");
+        bytes32 redeemedState = _state();
+        vm.expectRevert(
+            abi.encodeWithSelector(Swarm.ERC20InsufficientAllowance.selector, address(converter), 0, 99 ether)
+        );
+        vm.prank(ALICE);
+        converter.redeem(99 ether);
+        require(_state() == redeemedState, "redemption allowance reused");
+        _assertConverterAccounting();
+    }
+
+    function testRedeemInsufficientBalanceRestoresAllowanceAndPreservesBurns() public {
+        _convertForAlice(100_000 ether);
+        uint256[2] memory excessive = [uint256(100 ether), type(uint256).max];
+        for (uint256 i; i < excessive.length; ++i) {
+            vm.prank(ALICE);
+            require(token.approve(address(converter), excessive[i]), "approval failed");
+            bytes32 beforeState = _state();
+            vm.expectRevert(
+                abi.encodeWithSelector(Swarm.ERC20InsufficientBalance.selector, ALICE, 99 ether, excessive[i])
+            );
+            vm.prank(ALICE);
+            converter.redeem(excessive[i]);
+            require(_state() == beforeState, "failed Swarm pull changed state");
+        }
+        _assertConverterAccounting();
+    }
+
+    function testTransferredSwarmCanBeRedeemedByAnotherHolder() public {
+        _convertForAlice(100_000 ether);
+        vm.prank(ALICE);
+        require(token.transfer(BOB, 40 ether), "holder transfer failed");
+        vm.prank(BOB);
+        require(token.approve(address(converter), 39.6 ether), "holder approval failed");
+        vm.prank(BOB);
+        _eq(converter.redeem(39.6 ether), 39_204 ether, "wrong new-holder payout");
+        _eq(launchToken.balanceOf(BOB), 39_204 ether, "redemption did not pay caller");
+        _eq(launchToken.balanceOf(ALICE), 0, "redemption paid original converter user");
+        _eq(token.balanceOf(ALICE), 59 ether, "redemption debited original holder");
+        _eq(token.balanceOf(BOB), 0, "new holder did not spend gross SWORM");
+        _eq(tracker.totalBurned(), 1.796 ether, "inter-holder and redemption burns missing");
+        _assertConverterAccounting();
+    }
+
+    function testDonationsCannotInflateRedemptionPayment() public {
+        _convertForAlice(100_000 ether);
+        require(launchToken.transfer(address(converter), 777), "launch donation failed");
+        vm.prank(ALICE);
+        require(token.transfer(address(converter), 10 ether), "Swarm donation failed");
+        vm.prank(ALICE);
+        require(token.approve(address(converter), 89 ether), "approval failed");
+        vm.prank(ALICE);
+        _eq(converter.redeem(89 ether), 88_110 ether, "donation inflated redemption return");
+        _eq(launchToken.balanceOf(ALICE), 88_110 ether, "donation inflated payout");
+        _eq(launchToken.balanceOf(address(converter)), 11_890 ether + 777, "donated collateral was spent");
+        _eq(token.balanceOf(address(converter)), SUPPLY - 1.99 ether, "wrong donated reserve");
+        _eq(tracker.totalBurned(), 1.99 ether, "donation burn missing");
+        _assertConverterAccounting();
+    }
+
+    function testEntireSupplyCanConvertRedeemAndConvertAgain() public {
+        _convertForAlice(LAUNCH_SUPPLY);
+        _eq(token.balanceOf(address(converter)), 0, "full conversion did not exhaust reserve");
+        _eq(token.balanceOf(ALICE), 990_000 ether, "wrong full conversion receipt");
+        vm.prank(ALICE);
+        require(token.approve(address(converter), 990_000 ether), "approval failed");
+        vm.prank(ALICE);
+        _eq(converter.redeem(990_000 ether), 980_100_000 ether, "wrong full redemption");
+        _eq(token.balanceOf(address(converter)), 980_100 ether, "redemption did not replenish reserve");
+        _eq(tracker.totalBurned(), 19_900 ether, "wrong full round-trip burns");
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), 980_100_000 ether), "reconversion approval failed");
+        vm.prank(ALICE);
+        _eq(converter.convert(980_100_000 ether), 980_100 ether, "returned launch tokens cannot reconvert");
+        _eq(token.balanceOf(address(converter)), 0, "second full conversion did not exhaust reserve");
+        _eq(token.balanceOf(ALICE), 970_299 ether, "wrong reconversion receipt");
+        _eq(tracker.totalBurned(), 29_701 ether, "wrong reconversion burn");
+        _eq(launchToken.balanceOf(address(converter)), LAUNCH_SUPPLY, "wrong final collateral");
+        _assertConverterAccounting();
+    }
+
+    function testConverterHasNoAdminOrWithdrawalPrivileges() public {
+        _convertForAlice(100_000 ether);
+        bytes[6] memory calls = [
+            abi.encodeWithSignature("withdraw(address,uint256)", ALICE, 1 ether),
+            abi.encodeWithSignature("rescueTokens(address,address,uint256)", address(launchToken), ALICE, 1 ether),
+            abi.encodeWithSignature("setRate(uint256)", 1),
+            abi.encodeWithSignature("setLaunchToken(address)", ALICE),
+            abi.encodeWithSignature("transferOwnership(address)", ALICE),
+            abi.encodeWithSignature("initialize(address)", ALICE)
+        ];
+        bytes32 beforeState = _state();
+        for (uint256 i; i < calls.length; ++i) {
+            (bool deployerSucceeded,) = address(converter).call(calls[i]);
+            require(!deployerSucceeded, "converter deployer reached admin entrypoint");
+            vm.prank(ALICE);
+            (bool holderSucceeded,) = address(converter).call(calls[i]);
+            require(!holderSucceeded, "converter holder reached admin entrypoint");
+            require(_state() == beforeState, "admin call changed accounting");
+        }
+        require(address(converter.launchToken()) == address(launchToken), "launch binding changed");
+        require(address(converter.swarm()) == address(token), "Swarm binding changed");
+        require(address(converter.burnTracker()) == address(tracker), "tracker binding changed");
+        _eq(converter.RATE(), RATE, "conversion rate changed");
+        _assertConverterAccounting();
+    }
+
+    function testFuzzConverterRoundTripConservesCollateral(uint256 grossSeed, uint256 redeemSeed) public {
+        uint256 gross = 1 + grossSeed % SUPPLY;
+        uint256 outboundBurn = gross / 100;
+        uint256 received = gross - outboundBurn;
+        uint256 redeemed = 1 + redeemSeed % received;
+        uint256 inboundBurn = redeemed / 100;
+        uint256 payout = (redeemed - inboundBurn) * RATE;
+        _convertForAlice(gross * RATE);
+        _eq(token.balanceOf(ALICE), received, "fuzz conversion receipt wrong");
+        _eq(launchToken.allowance(ALICE, address(converter)), 0, "fuzz conversion allowance not spent");
+        vm.prank(ALICE);
+        require(token.approve(address(converter), redeemed), "fuzz redemption approval failed");
+        vm.prank(ALICE);
+        _eq(converter.redeem(redeemed), payout, "fuzz redemption return wrong");
+        _eq(token.balanceOf(ALICE), received - redeemed, "fuzz holder balance wrong");
+        _eq(token.balanceOf(address(converter)), SUPPLY - gross + redeemed - inboundBurn, "fuzz reserve wrong");
+        _eq(token.allowance(ALICE, address(converter)), 0, "fuzz redemption allowance not spent");
+        _eq(tracker.totalBurned(), outboundBurn + inboundBurn, "fuzz round-trip burns wrong");
+        _eq(launchToken.balanceOf(ALICE), payout, "fuzz redemption payment wrong");
+        _eq(launchToken.balanceOf(address(converter)), gross * RATE - payout, "fuzz locked collateral wrong");
+        _eq(launchToken.balanceOf(address(this)), LAUNCH_SUPPLY - gross * RATE, "fuzz launch funding debit wrong");
+        _assertConverterAccounting();
     }
 }

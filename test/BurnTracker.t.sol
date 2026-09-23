@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Swarm, SwarmLaunchToken} from "../src/Swarm.sol";
+import {Swarm, SwarmLaunchToken, SwarmConverter} from "../src/Swarm.sol";
 import {BurnTracker} from "../src/BurnTracker.sol";
 import {SwarmTestBase} from "./Swarm.t.sol";
 
@@ -13,22 +13,56 @@ contract BurnTrackerTest is SwarmTestBase {
     }
 
     function testProjectConstructorsPreserveLaunchSupplyAndBindTrackerToSwarm() public {
-        // BOB represents the same factory caller for all three constructors.
+        // BOB represents the factory; the converter deploys the child contracts.
         vm.prank(BOB);
         SwarmLaunchToken launchToken = new SwarmLaunchToken();
         _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "factory did not receive launch supply");
         vm.prank(BOB);
-        Swarm application = new Swarm();
-        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "Swarm constructor changed launch supply");
-        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "Swarm constructor moved factory launch balance");
-        vm.prank(BOB);
-        BurnTracker applicationTracker = new BurnTracker(address(application));
-        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "tracker constructor changed launch supply");
-        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "tracker constructor moved factory launch balance");
-        _eq(application.balanceOf(BOB), SUPPLY, "factory did not receive Swarm supply");
+        SwarmConverter converter = new SwarmConverter(address(launchToken));
+        Swarm application = converter.swarm();
+        BurnTracker applicationTracker = converter.burnTracker();
+        require(address(converter.launchToken()) == address(launchToken), "converter bound to wrong launch token");
+        _eq(converter.RATE(), 1_000, "wrong conversion rate");
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "converter constructor changed launch supply");
+        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "converter constructor moved factory launch balance");
+        _eq(launchToken.balanceOf(address(converter)), 0, "converter took launch tokens during construction");
+        _eq(application.balanceOf(address(converter)), SUPPLY, "converter did not receive Swarm supply");
+        _eq(application.balanceOf(BOB), 0, "Swarm supply stranded at factory");
         _eq(application.totalSupply(), SUPPLY, "wrong application supply");
         require(address(applicationTracker.token()) == address(application), "tracker bound to launch token");
         _eq(applicationTracker.totalBurned(), 0, "new application already reports burns");
+    }
+
+    function testConverterTrackerIncludesConversionsHolderBurnsAndRedemption() public {
+        SwarmLaunchToken launchToken = new SwarmLaunchToken();
+        SwarmConverter converter = new SwarmConverter(address(launchToken));
+        Swarm application = converter.swarm();
+        BurnTracker applicationTracker = converter.burnTracker();
+        require(launchToken.transfer(ALICE, 100_000 ether), "holder funding failed");
+        vm.prank(ALICE);
+        require(launchToken.approve(address(converter), 100_000 ether), "holder approval failed");
+        vm.prank(ALICE);
+        _eq(converter.convert(100_000 ether), 100 ether, "wrong gross conversion");
+        _eq(applicationTracker.totalBurned(), 1 ether, "conversion burn missing");
+        _eq(application.balanceOf(ALICE), 99 ether, "SWORM did not enter circulation");
+        vm.prank(ALICE);
+        require(application.transfer(ALICE, 99 ether), "holder self-transfer failed");
+        _eq(applicationTracker.totalBurned(), 1.99 ether, "holder burn missing");
+
+        BurnTracker late = new BurnTracker(address(application));
+        _eq(late.totalBurned(), 1.99 ether, "late tracker forgot conversion and holder burns");
+        vm.prank(ALICE);
+        require(application.approve(address(converter), 98.01 ether), "redemption approval failed");
+        vm.prank(ALICE);
+        _eq(converter.redeem(98.01 ether), 97_029.9 ether, "redemption ignored incoming burn");
+        _eq(applicationTracker.totalBurned(), 2.9701 ether, "redemption burn missing");
+        _eq(late.totalBurned(), 2.9701 ether, "late tracker missed redemption burn");
+        _eq(application.totalSupply(), SUPPLY - 2.9701 ether, "wrong supply after converter round trip");
+        _eq(application.balanceOf(address(converter)), application.totalSupply(), "redeemed SWORM lost");
+        _eq(application.balanceOf(ALICE), 0, "redemption did not spend gross SWORM");
+        _eq(launchToken.balanceOf(ALICE), 97_029.9 ether, "redemption paid wrong holder amount");
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "application burns changed launch supply");
+        _assertInitialState();
     }
 
     function testLaunchTransfersAndSwarmBurnsRemainIndependent() public {
