@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Swarm} from "../src/Swarm.sol";
+import {Swarm, SwarmLaunchToken} from "../src/Swarm.sol";
 import {BurnTracker} from "../src/BurnTracker.sol";
 
 // Only the Foundry cheatcodes used here are declared, so the suite needs no library.
@@ -28,13 +28,20 @@ interface SwarmVm {
 /// The tracker includes burns before its deployment; reads need no updates.
 ///
 /// Run `forge build`, `forge test`, and `forge test --gas-report`. No dependencies
-/// or configuration changes are needed. The suite has 51 tests, including five
+/// or configuration changes are needed. The suite has 65 tests, including six
 /// fuzz tests (256 runs each by default), exact events, rounding boundaries,
 /// allowance isolation, revert rollback, invalid tracker inputs and late binding.
 /// Calls after expectRevert intentionally do not inspect a returned bool.
-/// No test imports the removable protected harness. Its full-receipt, fixed-supply
-/// launch requirement conflicts with Swarm's required burn; .imd-findings.json
-/// records the concrete incompatibility. Passing these tests does not resolve it.
+/// No test imports the removable protected harness. SwarmLaunchToken() supplies
+/// the separate fixed-supply launch token: 1,000,000,000 SWLT with 18 decimals,
+/// minted to its constructor caller. Deploy Swarm and then BurnTracker bound to
+/// Swarm as applications. Their deployment and burns must leave SWLT unchanged.
+/// The added launch tests cover exact receipt, fixed supply, allowance failures,
+/// zero/self transfers, mint/admin rejection and constructor isolation.
+/// Behavioral tests pass with solc 0.8.26 and 0.8.30. The protected opcode scan
+/// passes for the launch token and tracker built with 0.8.26; with default 0.8.30
+/// metadata it rejects bytes in their CBOR trailers. .imd-findings.json reports
+/// this compiler-dependent artifact issue, which behavioral tests cannot fix.
 ///
 /// Gas report: Forge 1.7.1, solc 0.8.30, optimizer disabled. Reproduce the focused
 /// sample with `forge test --gas-report --match-test
@@ -46,6 +53,12 @@ interface SwarmVm {
 /// BurnTracker deployment: 231,540 gas, 1,304 creation bytes.
 /// BurnTracker.totalBurned(): 5,954 gas. Gas varies with state and calldata;
 /// the full report also includes zero transfers, reverts and fuzzed inputs.
+/// Launch sample: `forge test --gas-report --match-test
+/// testLaunchTransfersAndSwarmBurnsRemainIndependent` (one shell command).
+/// SwarmLaunchToken deployment: 774,307 gas, 3,405 creation bytes.
+/// Transfer 100 SWLT to fresh ALICE: 52,191 gas.
+/// Approve SPENDER for 200 SWLT from zero allowance: 46,540 gas.
+/// TransferFrom 200 SWLT to fresh BOB, exhausting allowance: 53,574 gas.
 abstract contract SwarmTestBase {
     SwarmVm internal constant vm = SwarmVm(address(uint160(uint256(keccak256("hevm cheat code")))));
     uint256 internal constant SUPPLY = 1_000_000 ether;
@@ -520,5 +533,237 @@ contract SwarmTest is SwarmTestBase {
         token.transferFrom(address(this), ALICE, amount);
         _eq(token.allowance(address(this), SPENDER), approved, "failed fuzz transfer spent allowance");
         _assertInitialState();
+    }
+}
+
+/// @dev Regression coverage for the separate launch token added after the
+/// original Swarm suite. Keep its fixed-supply expectations distinct from SWORM.
+contract SwarmLaunchTokenTest is SwarmTestBase {
+    uint256 internal constant LAUNCH_SUPPLY = 1_000_000_000 ether;
+    SwarmLaunchToken internal launchToken;
+
+    function setUp() public override {
+        launchToken = new SwarmLaunchToken();
+        super.setUp();
+    }
+
+    function _assertLaunchBalances(uint256 ownerBalance, uint256 aliceBalance, uint256 bobBalance) internal view {
+        _eq(launchToken.totalSupply(), LAUNCH_SUPPLY, "launch supply must remain fixed");
+        _eq(launchToken.balanceOf(address(this)), ownerBalance, "wrong launch deployer balance");
+        _eq(launchToken.balanceOf(ALICE), aliceBalance, "wrong launch Alice balance");
+        _eq(launchToken.balanceOf(BOB), bobBalance, "wrong launch Bob balance");
+        _eq(launchToken.balanceOf(SPENDER), 0, "launch spender took tokens");
+        _eq(launchToken.balanceOf(address(0)), 0, "launch credited zero address");
+        _eq(ownerBalance + aliceBalance + bobBalance, LAUNCH_SUPPLY, "launch balances do not conserve supply");
+        _assertInitialState();
+    }
+
+    function testLaunchConstructorMetadataSupplyAndMintEvent() public {
+        require(keccak256(bytes(launchToken.name())) == keccak256("Swarm Launch Token"), "wrong launch name");
+        require(keccak256(bytes(launchToken.symbol())) == keccak256("SWLT"), "wrong launch symbol");
+        _eq(launchToken.decimals(), 18, "wrong launch decimals");
+        _eq(launchToken.TOTAL_SUPPLY(), LAUNCH_SUPPLY, "wrong launch supply constant");
+        _eq(launchToken.allowance(address(this), SPENDER), 0, "launch starts with allowance");
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+
+        vm.recordLogs();
+        vm.prank(ALICE);
+        SwarmLaunchToken other = new SwarmLaunchToken();
+        _eq(other.totalSupply(), LAUNCH_SUPPLY, "wrong other launch supply");
+        _eq(other.balanceOf(ALICE), LAUNCH_SUPPLY, "launch mint did not reach constructor caller");
+        _eq(other.balanceOf(address(this)), 0, "launch mint reached the wrong deployer");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 1, "launch constructor must emit one mint");
+        _assertTransferLog(entries[0], address(other), address(0), ALICE, LAUNCH_SUPPLY);
+    }
+
+    function testLaunchTransferMovesExactAmountWithoutBurn() public {
+        // The protected token floor uses this exact fraction of initial supply.
+        uint256 amount = LAUNCH_SUPPLY / 1_000;
+        vm.recordLogs();
+        require(launchToken.transfer(ALICE, amount), "launch transfer returned false");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 1, "launch transfer emitted an extra event");
+        _assertTransferLog(entries[0], address(launchToken), address(this), ALICE, amount);
+        _assertLaunchBalances(LAUNCH_SUPPLY - amount, amount, 0);
+    }
+
+    function testLaunchEntireSupplyAndRepeatedSelfTransfersPreserveBalances() public {
+        require(launchToken.transfer(ALICE, LAUNCH_SUPPLY), "launch full-supply transfer failed");
+        for (uint256 i; i < 2; ++i) {
+            vm.recordLogs();
+            vm.prank(ALICE);
+            require(launchToken.transfer(ALICE, LAUNCH_SUPPLY), "launch self-transfer failed");
+            SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+            _eq(entries.length, 1, "launch self-transfer must emit one event");
+            _assertTransferLog(entries[0], address(launchToken), ALICE, ALICE, LAUNCH_SUPPLY);
+            _assertLaunchBalances(0, LAUNCH_SUPPLY, 0);
+        }
+    }
+
+    function testLaunchZeroTransfersWithoutBalanceOrAllowanceEmitEvents() public {
+        vm.recordLogs();
+        vm.prank(ALICE);
+        require(launchToken.transfer(BOB, 0), "launch zero transfer failed");
+        vm.prank(SPENDER);
+        require(launchToken.transferFrom(ALICE, ALICE, 0), "launch delegated zero self-transfer failed");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 2, "launch zero transfers must each emit an event");
+        _assertTransferLog(entries[0], address(launchToken), ALICE, BOB, 0);
+        _assertTransferLog(entries[1], address(launchToken), ALICE, ALICE, 0);
+        _eq(launchToken.allowance(ALICE, SPENDER), 0, "launch zero transfer changed allowance");
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+    }
+
+    function testLaunchTransferFromUsesExactAllowanceAndRejectsReuse() public {
+        require(launchToken.approve(SPENDER, 100 ether), "launch approval failed");
+        vm.recordLogs();
+        vm.prank(SPENDER);
+        require(launchToken.transferFrom(address(this), ALICE, 100 ether), "launch delegated transfer failed");
+        SwarmVm.Log[] memory entries = vm.getRecordedLogs();
+        _eq(entries.length, 1, "launch delegated transfer must emit one event");
+        _assertTransferLog(entries[0], address(launchToken), address(this), ALICE, 100 ether);
+        _eq(launchToken.allowance(address(this), SPENDER), 0, "launch exact allowance not consumed");
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, SPENDER, 0, 1));
+        vm.prank(SPENDER);
+        launchToken.transferFrom(address(this), ALICE, 1);
+        _assertLaunchBalances(LAUNCH_SUPPLY - 100 ether, 100 ether, 0);
+    }
+
+    function testLaunchUnlimitedAllowanceSurvivesDelegatedSelfAndRepeatedTransfers() public {
+        require(launchToken.approve(SPENDER, type(uint256).max), "launch unlimited approval failed");
+        vm.prank(SPENDER);
+        require(
+            launchToken.transferFrom(address(this), address(this), LAUNCH_SUPPLY),
+            "launch delegated self-transfer failed"
+        );
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+        for (uint256 i; i < 2; ++i) {
+            vm.prank(SPENDER);
+            require(launchToken.transferFrom(address(this), ALICE, 100 ether), "launch unlimited transfer failed");
+            _eq(
+                launchToken.allowance(address(this), SPENDER), type(uint256).max, "launch unlimited allowance decreased"
+            );
+        }
+        _assertLaunchBalances(LAUNCH_SUPPLY - 200 ether, 200 ether, 0);
+    }
+
+    function testLaunchInsufficientBalancesRejectDirectSelfAndDelegatedTransfers() public {
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientBalance.selector, ALICE, 0, 1));
+        vm.prank(ALICE);
+        launchToken.transfer(BOB, 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SwarmLaunchToken.ERC20InsufficientBalance.selector, address(this), LAUNCH_SUPPLY, type(uint256).max
+            )
+        );
+        launchToken.transfer(ALICE, type(uint256).max);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SwarmLaunchToken.ERC20InsufficientBalance.selector, address(this), LAUNCH_SUPPLY, LAUNCH_SUPPLY + 1
+            )
+        );
+        launchToken.transfer(address(this), LAUNCH_SUPPLY + 1);
+
+        require(launchToken.approve(SPENDER, LAUNCH_SUPPLY + 1), "launch excessive approval failed");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SwarmLaunchToken.ERC20InsufficientBalance.selector, address(this), LAUNCH_SUPPLY, LAUNCH_SUPPLY + 1
+            )
+        );
+        vm.prank(SPENDER);
+        launchToken.transferFrom(address(this), ALICE, LAUNCH_SUPPLY + 1);
+        _eq(launchToken.allowance(address(this), SPENDER), LAUNCH_SUPPLY + 1, "launch balance failure spent allowance");
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+    }
+
+    function testLaunchInvalidAddressesRevertAndRestoreAllowance() public {
+        require(launchToken.approve(SPENDER, 100 ether), "launch approval failed");
+        uint256[2] memory amounts = [uint256(0), 100 ether];
+        for (uint256 i; i < amounts.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InvalidReceiver.selector, address(0)));
+            launchToken.transfer(address(0), amounts[i]);
+            vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InvalidReceiver.selector, address(0)));
+            vm.prank(SPENDER);
+            launchToken.transferFrom(address(this), address(0), amounts[i]);
+            _eq(launchToken.allowance(address(this), SPENDER), 100 ether, "invalid launch receiver spent allowance");
+            vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InvalidSpender.selector, address(0)));
+            launchToken.approve(address(0), amounts[i]);
+        }
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InvalidSender.selector, address(0)));
+        vm.prank(SPENDER);
+        launchToken.transferFrom(address(0), ALICE, 0);
+        _eq(launchToken.allowance(address(this), address(0)), 0, "launch invalid spender gained allowance");
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+    }
+
+    function testLaunchAllowanceIsolationReplacementAndRevocation() public {
+        require(launchToken.approve(SPENDER, 100 ether), "launch approval failed");
+        require(launchToken.approve(SPENDER, 50 ether), "launch replacement failed");
+        vm.expectRevert(
+            abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, SPENDER, 50 ether, 100 ether)
+        );
+        vm.prank(SPENDER);
+        launchToken.transferFrom(address(this), ALICE, 100 ether);
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, BOB, 0, 1));
+        vm.prank(BOB);
+        launchToken.transferFrom(address(this), ALICE, 1);
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, SPENDER, 0, 1));
+        vm.prank(SPENDER);
+        launchToken.transferFrom(ALICE, BOB, 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, address(this), 0, 1)
+        );
+        launchToken.transferFrom(address(this), ALICE, 1);
+        _eq(launchToken.allowance(address(this), SPENDER), 50 ether, "failed launch calls changed allowance");
+        require(launchToken.approve(SPENDER, 0), "launch revocation failed");
+        vm.expectRevert(abi.encodeWithSelector(SwarmLaunchToken.ERC20InsufficientAllowance.selector, SPENDER, 0, 1));
+        vm.prank(SPENDER);
+        launchToken.transferFrom(address(this), ALICE, 1);
+        _eq(launchToken.allowance(address(this), SPENDER), 0, "launch revocation undone");
+        _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+    }
+
+    function testLaunchAdminCallsRejectDeployerAndStranger() public {
+        bytes[10] memory calls = [
+            abi.encodeWithSignature("mint(address,uint256)", ALICE, 1 ether),
+            abi.encodeWithSignature("mint(uint256)", 1 ether),
+            abi.encodeWithSignature("mint()"),
+            abi.encodeWithSignature("issue(uint256)", 1 ether),
+            abi.encodeWithSignature("setOwner(address)", ALICE),
+            abi.encodeWithSignature("transferOwnership(address)", ALICE),
+            abi.encodeWithSignature("upgradeTo(address)", ALICE),
+            abi.encodeWithSignature("initialize(address)", ALICE),
+            abi.encodeWithSignature("unpause()"),
+            abi.encodeWithSignature("setMinter(address)", ALICE)
+        ];
+        for (uint256 i; i < calls.length; ++i) {
+            (bool deployerSucceeded,) = address(launchToken).call(calls[i]);
+            require(!deployerSucceeded, "launch deployer reached an admin entrypoint");
+            vm.prank(ALICE);
+            (bool strangerSucceeded,) = address(launchToken).call(calls[i]);
+            require(!strangerSucceeded, "launch stranger reached an admin entrypoint");
+            _assertLaunchBalances(LAUNCH_SUPPLY, 0, 0);
+        }
+    }
+
+    function testFuzzLaunchTransfersConserveFixedSupply(uint256 directSeed, uint256 delegatedSeed, bool self) public {
+        uint256 directAmount = directSeed % (LAUNCH_SUPPLY + 1);
+        uint256 delegatedAmount = delegatedSeed % (directAmount + 1);
+        require(launchToken.transfer(ALICE, directAmount), "fuzz launch transfer failed");
+        _assertLaunchBalances(LAUNCH_SUPPLY - directAmount, directAmount, 0);
+        vm.prank(ALICE);
+        require(launchToken.approve(SPENDER, delegatedAmount), "fuzz launch approval failed");
+        vm.prank(SPENDER);
+        require(
+            launchToken.transferFrom(ALICE, self ? ALICE : BOB, delegatedAmount),
+            "fuzz launch delegated transfer failed"
+        );
+        _eq(launchToken.allowance(ALICE, SPENDER), 0, "fuzz launch allowance not consumed");
+        _assertLaunchBalances(
+            LAUNCH_SUPPLY - directAmount,
+            self ? directAmount : directAmount - delegatedAmount,
+            self ? 0 : delegatedAmount
+        );
     }
 }

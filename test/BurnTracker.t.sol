@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Swarm} from "../src/Swarm.sol";
+import {Swarm, SwarmLaunchToken} from "../src/Swarm.sol";
 import {BurnTracker} from "../src/BurnTracker.sol";
 import {SwarmTestBase} from "./Swarm.t.sol";
 
@@ -9,6 +9,56 @@ contract BurnTrackerTest is SwarmTestBase {
     function testConstructorBindsTokenAndStartsAtZero() public view {
         require(address(tracker.token()) == address(token), "tracker bound to wrong token");
         _eq(tracker.totalBurned(), 0, "fresh token has no burns");
+        _assertInitialState();
+    }
+
+    function testProjectConstructorsPreserveLaunchSupplyAndBindTrackerToSwarm() public {
+        // BOB represents the same factory caller for all three constructors.
+        vm.prank(BOB);
+        SwarmLaunchToken launchToken = new SwarmLaunchToken();
+        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "factory did not receive launch supply");
+        vm.prank(BOB);
+        Swarm application = new Swarm();
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "Swarm constructor changed launch supply");
+        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "Swarm constructor moved factory launch balance");
+        vm.prank(BOB);
+        BurnTracker applicationTracker = new BurnTracker(address(application));
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "tracker constructor changed launch supply");
+        _eq(launchToken.balanceOf(BOB), 1_000_000_000 ether, "tracker constructor moved factory launch balance");
+        _eq(application.balanceOf(BOB), SUPPLY, "factory did not receive Swarm supply");
+        _eq(application.totalSupply(), SUPPLY, "wrong application supply");
+        require(address(applicationTracker.token()) == address(application), "tracker bound to launch token");
+        _eq(applicationTracker.totalBurned(), 0, "new application already reports burns");
+    }
+
+    function testLaunchTransfersAndSwarmBurnsRemainIndependent() public {
+        SwarmLaunchToken launchToken = new SwarmLaunchToken();
+        require(token.transfer(ALICE, 100 ether), "Swarm transfer failed");
+        require(launchToken.transfer(ALICE, 100 ether), "launch transfer failed");
+        require(launchToken.approve(SPENDER, 200 ether), "launch approval failed");
+        vm.prank(SPENDER);
+        require(launchToken.transferFrom(address(this), BOB, 200 ether), "launch delegated transfer failed");
+        _eq(tracker.totalBurned(), 1 ether, "launch activity changed Swarm burns");
+        _eq(token.balanceOf(ALICE), 99 ether, "Swarm must still burn one percent");
+        _assertConservation();
+        vm.prank(ALICE);
+        require(token.transfer(ALICE, 99 ether), "Swarm self-transfer failed");
+        _eq(tracker.totalBurned(), 1.99 ether, "Swarm self-transfer burn missing");
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "Swarm burns reduced launch supply");
+        _eq(launchToken.balanceOf(address(this)), 1_000_000_000 ether - 300 ether, "wrong launch debit");
+        _eq(launchToken.balanceOf(ALICE), 100 ether, "launch receipt incurred a burn");
+        _eq(launchToken.balanceOf(BOB), 200 ether, "launch delegated receipt incurred a burn");
+        _assertConservation();
+    }
+
+    function testConstructorRejectsLaunchTokenInPlaceOfSwarm() public {
+        SwarmLaunchToken launchToken = new SwarmLaunchToken();
+        vm.expectRevert();
+        new BurnTracker(address(launchToken));
+        _eq(launchToken.totalSupply(), 1_000_000_000 ether, "failed tracker constructor changed launch supply");
+        _eq(
+            launchToken.balanceOf(address(this)), 1_000_000_000 ether, "failed tracker constructor moved launch balance"
+        );
         _assertInitialState();
     }
 
